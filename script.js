@@ -7,26 +7,67 @@ import {
   saveUserData,
 } from "./firebase-init.js";
 
-/* ===================== データ層(Firebase) =====================
-   フォルダ・問題データは、ログイン中ユーザーのFirestoreドキュメント
-   (users/{uid}/appData/main) にまとめて保存する。
+/* ===================== データ層(Firebase / ゲストモード) =====================
+   ログインユーザーはFirestoreドキュメント(users/{uid}/appData/main)に保存する。
+   ログインしない場合は「ゲストモード」として、この端末のlocalStorageのみに
+   保存する(他の端末とは同期されない)。
    保存処理は連続操作時にリクエストが重複しないよう簡易的にデバウンスする。 */
+
+const GUEST_STORAGE_KEY = "dandan_guest_data_v1";
 
 let folders = [];
 let cards = [];
 let currentUser = null;
+let isGuest = false; // ログインせずに使っている状態か
 let saveTimer = null;
 
+function loadGuestData(){
+  try{
+    const raw = localStorage.getItem(GUEST_STORAGE_KEY);
+    if(!raw) return {folders:[], cards:[]};
+    const data = JSON.parse(raw);
+    return {
+      folders: Array.isArray(data.folders) ? data.folders : [],
+      cards: Array.isArray(data.cards) ? data.cards : [],
+    };
+  }catch(e){
+    return {folders:[], cards:[]};
+  }
+}
+
+function saveGuestData(){
+  try{
+    localStorage.setItem(GUEST_STORAGE_KEY, JSON.stringify({
+      folders, cards, updatedAt:new Date().toISOString()
+    }));
+  }catch(e){
+    showToast("この端末への保存に失敗しました。");
+  }
+}
+
+function hasGuestData(){
+  const d = loadGuestData();
+  return d.folders.length>0 || d.cards.length>0;
+}
+
+function clearGuestData(){
+  try{ localStorage.removeItem(GUEST_STORAGE_KEY); }catch(e){}
+}
+
 function scheduleSave(){
-  if(!currentUser) return;
-  clearTimeout(saveTimer);
-  saveTimer = setTimeout(async ()=>{
-    try{
-      await saveUserData(currentUser.uid, {folders, cards});
-    }catch(e){
-      showToast("保存に失敗しました。通信環境をご確認ください。");
-    }
-  }, 400);
+  if(currentUser){
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(async ()=>{
+      try{
+        await saveUserData(currentUser.uid, {folders, cards});
+      }catch(e){
+        showToast("保存に失敗しました。通信環境をご確認ください。");
+      }
+    }, 400);
+  }else if(isGuest){
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(()=>{ saveGuestData(); }, 400);
+  }
 }
 // 既存コードとの互換のため、フォルダ/問題どちらの変更でも同じ保存処理を呼ぶ
 function saveFolders(){ scheduleSave(); }
@@ -41,6 +82,29 @@ async function loadDataForUser(user){
     folders = [];
     cards = [];
     showToast("データの読み込みに失敗しました。通信環境をご確認ください。");
+  }
+}
+
+/**
+ * ゲストモードで貯めたデータがある状態でログインした場合、
+ * ログイン後のアカウントデータへ1回だけ合流させる(端末内データを失わないため)。
+ */
+async function mergeGuestDataIntoAccount(user){
+  const guest = loadGuestData();
+  if(guest.folders.length===0 && guest.cards.length===0) return;
+  try{
+    const remote = await loadUserData(user.uid);
+    const merged = {
+      folders: [...remote.folders, ...guest.folders],
+      cards: [...remote.cards, ...guest.cards],
+    };
+    await saveUserData(user.uid, merged);
+    folders = merged.folders;
+    cards = merged.cards;
+    clearGuestData();
+    showToast("この端末に保存されていたデータをアカウントに引き継ぎました");
+  }catch(e){
+    showToast("端末データの引き継ぎに失敗しました。通信環境をご確認ください。");
   }
 }
 
@@ -157,7 +221,8 @@ function renderLoginScreen(){
   const main = document.createElement("main");
   const wrap = document.createElement("div");
   wrap.className="empty-state";
-  wrap.innerHTML = `<div class="mark">帳</div><p>ログインすると、端末をまたいで暗記帳を使えます。</p>`;
+  wrap.innerHTML = `<div class="mark">帳</div><p>ログインすると、端末をまたいで暗記帳を使えます。<br>ログインしなくても、この端末だけで今すぐ使い始めることもできます。</p>`;
+
   const btn = document.createElement("button");
   btn.className="btn btn-primary";
   btn.textContent="Googleでログイン";
@@ -174,6 +239,21 @@ function renderLoginScreen(){
     }
   };
   wrap.appendChild(btn);
+
+  const guestBtn = document.createElement("button");
+  guestBtn.className="btn-text";
+  guestBtn.style.display="block";
+  guestBtn.style.margin="14px auto 0";
+  guestBtn.textContent="ログインせずに使ってみる(この端末のみに保存)";
+  guestBtn.onclick = ()=>{
+    isGuest = true;
+    const data = loadGuestData();
+    folders = data.folders;
+    cards = data.cards;
+    navigate("home");
+  };
+  wrap.appendChild(guestBtn);
+
   main.appendChild(wrap);
   app.appendChild(main);
 }
@@ -191,7 +271,7 @@ function renderLoadingScreen(){
 
 /* ===================== レンダリング ===================== */
 function render(){
-  if(!currentUser){ renderLoginScreen(); return; }
+  if(!currentUser && !isGuest){ renderLoginScreen(); return; }
 
   const app = document.getElementById("app");
   app.innerHTML = "";
@@ -225,20 +305,40 @@ function renderHeader(){
   const brand = document.createElement("div");
   if(route.name==="home"){
     brand.className="brand";
-    brand.innerHTML = `DaNDaN暗記帳<small>どこで・何年・だれが・何をした</small>`;
+    const guestNote = isGuest ? `<small style="color:var(--hanko);">この端末のみに保存中(未ログイン)</small>` : `<small>どこで・何年・だれが・何をした</small>`;
+    brand.innerHTML = `DaNDaN暗記帳${guestNote}`;
     header.appendChild(brand);
 
-    const logoutBtn = document.createElement("button");
-    logoutBtn.className="back-btn";
-    logoutBtn.textContent="ログアウト";
-    logoutBtn.onclick = async ()=>{
-      openModal({
-        title:"ログアウトしますか?",
-        confirmLabel:"ログアウトする",
-        onConfirm: async ()=>{ await signOutUser(); }
-      });
-    };
-    header.appendChild(logoutBtn);
+    if(isGuest){
+      const linkBtn = document.createElement("button");
+      linkBtn.className="back-btn";
+      linkBtn.textContent="ログインして同期";
+      linkBtn.onclick = async ()=>{
+        linkBtn.disabled = true;
+        linkBtn.textContent = "ログイン中...";
+        try{
+          await signInWithGoogle();
+          // ログイン成功後の合流処理は watchAuthState のコールバックで行われる
+        }catch(e){
+          showToast("ログインに失敗しました。もう一度お試しください。");
+          linkBtn.disabled = false;
+          linkBtn.textContent = "ログインして同期";
+        }
+      };
+      header.appendChild(linkBtn);
+    }else{
+      const logoutBtn = document.createElement("button");
+      logoutBtn.className="back-btn";
+      logoutBtn.textContent="ログアウト";
+      logoutBtn.onclick = async ()=>{
+        openModal({
+          title:"ログアウトしますか?",
+          confirmLabel:"ログアウトする",
+          onConfirm: async ()=>{ await signOutUser(); }
+        });
+      };
+      header.appendChild(logoutBtn);
+    }
   }else{
     const back = document.createElement("button");
     back.className="back-btn";
@@ -980,13 +1080,18 @@ function escapeHtml(str){
 /* ===================== 起動 ===================== */
 renderLoadingScreen();
 watchAuthState(async (user)=>{
+  const wasGuest = isGuest;
   currentUser = user;
   if(user){
+    isGuest = false;
     await loadDataForUser(user);
+    if(wasGuest) await mergeGuestDataIntoAccount(user);
     navigate("home");
-  }else{
+  }else if(!wasGuest){
+    // ゲストモードで操作中でなければ、未ログイン画面用にデータを空にする
     folders = [];
     cards = [];
     render();
   }
+  // wasGuest===true かつ user===null の場合は、ゲストモードの表示・データを維持する
 });
