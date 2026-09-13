@@ -1,29 +1,47 @@
-/* ===================== データ層 ===================== */
-const STORAGE_FOLDERS = "folders";
-const STORAGE_CARDS = "cards";
+import {
+  auth,
+  signInWithGoogle,
+  signOutUser,
+  watchAuthState,
+  loadUserData,
+  saveUserData,
+} from "./firebase-init.js";
+
+/* ===================== データ層(Firebase) =====================
+   フォルダ・問題データは、ログイン中ユーザーのFirestoreドキュメント
+   (users/{uid}/appData/main) にまとめて保存する。
+   保存処理は連続操作時にリクエストが重複しないよう簡易的にデバウンスする。 */
 
 let folders = [];
 let cards = [];
-let storageReady = false;
+let currentUser = null;
+let saveTimer = null;
 
-async function loadData(){
-  try{
-    const f = await window.storage.get(STORAGE_FOLDERS, false);
-    folders = f ? JSON.parse(f.value) : [];
-  }catch(e){ folders = []; }
-  try{
-    const c = await window.storage.get(STORAGE_CARDS, false);
-    cards = c ? JSON.parse(c.value) : [];
-  }catch(e){ cards = []; }
-  storageReady = true;
+function scheduleSave(){
+  if(!currentUser) return;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(async ()=>{
+    try{
+      await saveUserData(currentUser.uid, {folders, cards});
+    }catch(e){
+      showToast("保存に失敗しました。通信環境をご確認ください。");
+    }
+  }, 400);
 }
-async function saveFolders(){
-  try{ await window.storage.set(STORAGE_FOLDERS, JSON.stringify(folders), false); }
-  catch(e){ showToast("保存に失敗しました"); }
-}
-async function saveCards(){
-  try{ await window.storage.set(STORAGE_CARDS, JSON.stringify(cards), false); }
-  catch(e){ showToast("保存に失敗しました"); }
+// 既存コードとの互換のため、フォルダ/問題どちらの変更でも同じ保存処理を呼ぶ
+function saveFolders(){ scheduleSave(); }
+function saveCards(){ scheduleSave(); }
+
+async function loadDataForUser(user){
+  try{
+    const data = await loadUserData(user.uid);
+    folders = data.folders;
+    cards = data.cards;
+  }catch(e){
+    folders = [];
+    cards = [];
+    showToast("データの読み込みに失敗しました。通信環境をご確認ください。");
+  }
 }
 
 function uid(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,7); }
@@ -123,8 +141,58 @@ function showToast(msg){
   setTimeout(()=>t.classList.remove("show"), 1800);
 }
 
+/* ===================== ログイン画面 ===================== */
+function renderLoginScreen(){
+  const app = document.getElementById("app");
+  app.innerHTML = "";
+
+  const header = document.createElement("header");
+  header.className = "top";
+  const brand = document.createElement("div");
+  brand.className="brand";
+  brand.innerHTML = `DaNDaN暗記帳<small>どこで・何年・だれが・何をした</small>`;
+  header.appendChild(brand);
+  app.appendChild(header);
+
+  const main = document.createElement("main");
+  const wrap = document.createElement("div");
+  wrap.className="empty-state";
+  wrap.innerHTML = `<div class="mark">帳</div><p>ログインすると、端末をまたいで暗記帳を使えます。</p>`;
+  const btn = document.createElement("button");
+  btn.className="btn btn-primary";
+  btn.textContent="Googleでログイン";
+  btn.onclick = async ()=>{
+    btn.disabled = true;
+    btn.textContent = "ログイン中...";
+    try{
+      await signInWithGoogle();
+      // ログイン成功後の処理は watchAuthState のコールバックで行われる
+    }catch(e){
+      showToast("ログインに失敗しました。もう一度お試しください。");
+      btn.disabled = false;
+      btn.textContent = "Googleでログイン";
+    }
+  };
+  wrap.appendChild(btn);
+  main.appendChild(wrap);
+  app.appendChild(main);
+}
+
+function renderLoadingScreen(){
+  const app = document.getElementById("app");
+  app.innerHTML = "";
+  const main = document.createElement("main");
+  main.style.textAlign = "center";
+  main.style.paddingTop = "80px";
+  main.style.color = "var(--ink-soft)";
+  main.textContent = "読み込み中...";
+  app.appendChild(main);
+}
+
 /* ===================== レンダリング ===================== */
 function render(){
+  if(!currentUser){ renderLoginScreen(); return; }
+
   const app = document.getElementById("app");
   app.innerHTML = "";
   const header = renderHeader();
@@ -159,6 +227,18 @@ function renderHeader(){
     brand.className="brand";
     brand.innerHTML = `DaNDaN暗記帳<small>どこで・何年・だれが・何をした</small>`;
     header.appendChild(brand);
+
+    const logoutBtn = document.createElement("button");
+    logoutBtn.className="back-btn";
+    logoutBtn.textContent="ログアウト";
+    logoutBtn.onclick = async ()=>{
+      openModal({
+        title:"ログアウトしますか?",
+        confirmLabel:"ログアウトする",
+        onConfirm: async ()=>{ await signOutUser(); }
+      });
+    };
+    header.appendChild(logoutBtn);
   }else{
     const back = document.createElement("button");
     back.className="back-btn";
@@ -898,7 +978,15 @@ function escapeHtml(str){
 }
 
 /* ===================== 起動 ===================== */
-(async function init(){
-  await loadData();
-  render();
-})();
+renderLoadingScreen();
+watchAuthState(async (user)=>{
+  currentUser = user;
+  if(user){
+    await loadDataForUser(user);
+    navigate("home");
+  }else{
+    folders = [];
+    cards = [];
+    render();
+  }
+});
